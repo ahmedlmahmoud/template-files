@@ -1,2 +1,1 @@
-buildSystem: docker
 containerPort: 8000
