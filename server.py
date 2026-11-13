@@ -1,29 +1,32 @@
-"""Canonical Floppy egress-door probe. SAME FILE on all 4 providers.
+"""Hostless exit probe + duplex tunnel to Floppy.
 
-Boot behaviour (identical everywhere):
-  - log EGRESS <ip>
-  - log REACH <status line>   (unauthenticated GET to Floppy)
-  - log AUTH  <status line> | BODY <first 200 bytes>   (authenticated GET)
-  - then stay up: HTTP server on $PORT if set, otherwise idle loop.
+Endpoints (PORT from the environment, bind 0.0.0.0):
+  GET /health                         -> ok <egress-ip>
+  GET /probe                          -> unauthenticated Floppy status line
+  GET /auth                           -> authenticated status line, or no-seat
+  GET /hs?c=<host>&p=<port>           -> dial host:port, return first status line
+  GET /ws[?h=<host>&p=<port>]         -> RFC6455 binary tunnel (no subprotocol)
 
-Endpoints when $PORT is set:
-  /health -> ok <egress-ip>
-  /probe  -> current unauthenticated status line
-  /auth   -> current authenticated status line + first 200 body bytes
-
-Secrets come ONLY from env SEAT_USER / SEAT_PASS. Never logged, never printed.
+Default tunnel backend is 170.23.130.191:10080. No seat secret is read by
+/hs or /ws. Proxy-Authorization, if any, is only bytes inside the tunnel.
 """
 import base64
+import hashlib
 import os
+import select
 import socket
-import sys
+import socketserver
+import threading
 import time
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 FLOPPY_HOST = "170.23.130.191"
+FLOPPY_PORT = 10080
 PORTS = (10080, 10443, 10800)
 REQ = "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n"
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_FRAME = 8 * 1024 * 1024
 
 
 def stamp():
@@ -49,7 +52,7 @@ def egress_ip():
     return "unknown"
 
 
-def dial(port, auth=False):
+def dial(host, port, auth=False):
     extra = ""
     if auth:
         u = os.environ.get("SEAT_USER", "")
@@ -61,7 +64,7 @@ def dial(port, auth=False):
     s = socket.socket()
     s.settimeout(12)
     try:
-        s.connect((FLOPPY_HOST, port))
+        s.connect((host, port))
         s.sendall((REQ + extra + "\r\n").encode())
         data = b""
         while b"\r\n\r\n" not in data and len(data) < 8000:
@@ -95,53 +98,279 @@ def dial(port, auth=False):
 def boot_evidence():
     ip = egress_ip()
     log("EGRESS", ip)
-    line, _ = dial(10080, auth=False)
+    line, _ = dial(FLOPPY_HOST, FLOPPY_PORT, auth=False)
     log("REACH", line)
-    line, body = dial(10080, auth=True)
+    line, body = dial(FLOPPY_HOST, FLOPPY_PORT, auth=True)
     log("AUTH", f"{line} | BODY {body}")
-    # extra ports, for providers whose outbound firewall is selective
     for port in (10443, 10800):
-        line, _ = dial(port, auth=False)
+        line, _ = dial(FLOPPY_HOST, port, auth=False)
         log(f"REACH_{port}", line)
     return ip
 
 
-class Handler(BaseHTTPRequestHandler):
-    def _send(self, text):
-        b = text.encode()
-        self.send_response(200)
-        self.send_header("content-type", "text/plain")
-        self.send_header("content-length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+def send_http(conn, code, text):
+    reason = {200: "OK", 400: "Bad Request", 404: "Not Found"}.get(code, "OK")
+    body = text.encode("utf-8", "replace")
+    head = (
+        f"HTTP/1.1 {code} {reason}\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode("ascii")
+    conn.sendall(head + body)
 
-    def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        if path == "/health":
-            self._send(f"ok {egress_ip()}")
-        elif path == "/probe":
-            line, _ = dial(10080, auth=False)
-            self._send(line)
-        elif path == "/auth":
-            line, body = dial(10080, auth=True)
-            self._send(f"{line} | BODY {body}")
-        else:
-            self._send("ok")
 
-    def log_message(self, fmt, *args):
+def read_http_request(conn):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = conn.recv(1024)
+        if not chunk:
+            return None
+        buf += chunk
+        if len(buf) > 16384:
+            return None
+    head, _rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.decode("latin1", "replace").split("\r\n")
+    if not lines or " " not in lines[0]:
+        return None
+    parts = lines[0].split(" ")
+    if len(parts) < 2:
+        return None
+    method, target = parts[0].upper(), parts[1]
+    headers = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        headers[k.strip().lower()] = v.strip()
+    return method, target, headers
+
+
+def parse_port(raw, default):
+    if raw is None or raw == "":
+        return default
+    try:
+        port = int(raw)
+    except ValueError:
+        return None
+    if port < 1 or port > 65535:
+        return None
+    return port
+
+
+def safe_host(raw):
+    if not raw or len(raw) > 253:
+        return None
+    if any(c in raw for c in " \r\n\t/\\"):
+        return None
+    return raw
+
+
+def ws_accept(key):
+    digest = hashlib.sha1((key + WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def recv_exact(conn, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("socket closed")
+        buf += chunk
+    return buf
+
+
+def read_frame(conn):
+    b0, b1 = recv_exact(conn, 2)
+    fin = (b0 & 0x80) != 0
+    opcode = b0 & 0x0F
+    masked = (b1 & 0x80) != 0
+    length = b1 & 0x7F
+    if length == 126:
+        length = int.from_bytes(recv_exact(conn, 2), "big")
+    elif length == 127:
+        length = int.from_bytes(recv_exact(conn, 8), "big")
+    if length > MAX_FRAME:
+        raise ValueError("frame too large")
+    mask = recv_exact(conn, 4) if masked else None
+    payload = recv_exact(conn, length) if length else b""
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return fin, opcode, payload
+
+
+def send_frame(conn, opcode, payload):
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    n = len(payload)
+    if n < 126:
+        header.append(n)
+    elif n < 65536:
+        header.append(126)
+        header += n.to_bytes(2, "big")
+    else:
+        header.append(127)
+        header += n.to_bytes(8, "big")
+    conn.sendall(bytes(header) + payload)
+
+
+def relay(client, host, port):
+    try:
+        backend = socket.create_connection((host, port), timeout=12)
+    except Exception as e:
+        log("WS", f"dial-fail {host}:{port} {type(e).__name__}")
+        try:
+            send_frame(client, 0x8, (1001).to_bytes(2, "big"))
+        except Exception:
+            pass
         return
+    backend.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    backend.settimeout(None)
+    client.settimeout(None)
+    log("WS", f"open {host}:{port}")
+    stop = threading.Event()
+    lock = threading.Lock()
+
+    def pump():
+        try:
+            while not stop.is_set():
+                data = backend.recv(16384)
+                if not data:
+                    break
+                with lock:
+                    send_frame(client, 0x2, data)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+
+    threading.Thread(target=pump, daemon=True).start()
+    frag = b""
+    try:
+        while not stop.is_set():
+            ready, _, _ = select.select([client], [], [], 1.0)
+            if not ready:
+                continue
+            fin, opcode, payload = read_frame(client)
+            if opcode == 0x8:
+                break
+            if opcode == 0x9:
+                with lock:
+                    send_frame(client, 0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                if fin:
+                    backend.sendall(payload)
+                else:
+                    frag = payload
+            elif opcode == 0x0:
+                frag += payload
+                if fin:
+                    backend.sendall(frag)
+                    frag = b""
+    except Exception as e:
+        log("WS", f"relay-end {type(e).__name__}")
+    finally:
+        stop.set()
+        for s in (backend, client):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+        log("WS", f"close {host}:{port}")
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        conn = self.connection
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(20)
+        try:
+            req = read_http_request(conn)
+        except Exception:
+            return
+        if not req:
+            return
+        method, target, headers = req
+        if method != "GET":
+            send_http(conn, 400, "GET only")
+            return
+        parts = urlsplit(target)
+        path = parts.path or "/"
+        qs = parse_qs(parts.query)
+        if path == "/health":
+            send_http(conn, 200, f"ok {egress_ip()}")
+        elif path == "/probe":
+            line, _ = dial(FLOPPY_HOST, FLOPPY_PORT, auth=False)
+            send_http(conn, 200, line)
+        elif path == "/auth":
+            line, body = dial(FLOPPY_HOST, FLOPPY_PORT, auth=True)
+            send_http(conn, 200, f"{line} | BODY {body}")
+        elif path == "/hs":
+            host = safe_host((qs.get("c") or [""])[0])
+            port = parse_port((qs.get("p") or [""])[0], None)
+            if not host or port is None:
+                send_http(conn, 400, "need c and p")
+                return
+            line, _ = dial(host, port, auth=False)
+            send_http(conn, 200, line)
+        elif path == "/ws":
+            self._upgrade(conn, headers, qs)
+        elif path == "/":
+            send_http(conn, 200, "ok")
+        else:
+            send_http(conn, 404, "not found")
+
+    def _upgrade(self, conn, headers, qs):
+        if headers.get("upgrade", "").lower() != "websocket":
+            send_http(conn, 400, "websocket upgrade required")
+            return
+        if headers.get("sec-websocket-version", "") != "13":
+            send_http(conn, 400, "version 13 required")
+            return
+        key = headers.get("sec-websocket-key", "")
+        if not key:
+            send_http(conn, 400, "missing key")
+            return
+        host = safe_host((qs.get("h") or [FLOPPY_HOST])[0]) or FLOPPY_HOST
+        port = parse_port((qs.get("p") or [""])[0], FLOPPY_PORT)
+        if port is None:
+            send_http(conn, 400, "bad port")
+            return
+        accept = ws_accept(key)
+        # No Sec-WebSocket-Protocol: subprotocol stays none.
+        resp = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        )
+        conn.sendall(resp.encode("ascii"))
+        relay(conn, host, port)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def main():
-    ip = boot_evidence()
+    boot_evidence()
     port = int(os.environ.get("PORT", "0") or "0")
-    if port:
-        log("SERVE", f"listening on 0.0.0.0:{port}")
-        ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
-    else:
+    if not port:
         log("WORKER", "no PORT set; staying up as idle worker")
         while True:
             time.sleep(60)
+    log("SERVE", f"listening on 0.0.0.0:{port}")
+    Server(("0.0.0.0", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
