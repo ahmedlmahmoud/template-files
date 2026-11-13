@@ -363,14 +363,18 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 def main():
-    boot_evidence()
     port = int(os.environ.get("PORT", "0") or "0")
     if not port:
+        boot_evidence()
         log("WORKER", "no PORT set; staying up as idle worker")
         while True:
             time.sleep(60)
+    # Bind before the Floppy dials. A health check must not wait on the
+    # backend, and a stuck dial must not keep the process from listening.
     log("SERVE", f"listening on 0.0.0.0:{port}")
-    Server(("0.0.0.0", port), Handler).serve_forever()
+    server = Server(("0.0.0.0", port), Handler)
+    threading.Thread(target=boot_evidence, daemon=True).start()
+    server.serve_forever()
 
 
 if __name__ == "__main__":
